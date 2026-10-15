@@ -1,0 +1,169 @@
+\documentclass[conference]{IEEEtran}
+\usepackage[main=portuguese,provide=*]{babel}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\begin{document}
+
+\title{MLP from Scratch na Base Íris: Depuração da Implementação, Classificação das Três Espécies e Análise de Convergência e Overfitting}
+
+\author{
+    \IEEEauthorblockN{
+        \begin{tabular}{c}
+            Gustavo Gabriel Ripka \\
+            GRR20203935
+        \end{tabular}
+        \qquad \qquad
+        \begin{tabular}{c}
+            Arthur Barreto Godoi \\
+            GRR20224377
+        \end{tabular}
+    }
+    \vspace{0.2cm}
+    \IEEEauthorblockA{
+        \textit{Departamento de Informática} \\
+        \textit{Universidade Federal do Paraná -- UFPR}\\
+        Curitiba, Brasil
+    }
+}
+
+\maketitle
+
+\begin{abstract}
+Este trabalho estuda, depura e experimenta uma implementação de Perceptron Multicamadas (MLP) \emph{from scratch} --- sem frameworks de aprendizado profundo --- na tarefa de classificar as três espécies da base Íris. A análise do código original revelou cinco defeitos relevantes, dos quais o mais grave era o uso de \texttt{random.shuffle} sobre um \texttt{ndarray} bidimensional do NumPy: as trocas de linhas viram duplicações por \emph{aliasing} de \emph{views}, perdendo amostras e quase eliminando a classe \textit{virginica} do treino --- essa corrupção, e não o algoritmo de retropropagação (que estava correto), era o que impedia classificar bem as três classes. Com as correções e divisão estratificada 80/20, a configuração original já atinge 96,7\% de acurácia de teste. Experimentos sistemáticos (ativação $\times$ neurônios ocultos $\times$ learning rate, 3 sementes) mostraram que a normalização z-score exige recalibrar o learning rate (0,005 $\to$ 0,01--0,05) para não degradar o desempenho, que a \texttt{sigmoid} atinge piso de erro menor que a \texttt{tanh} com alvos one-hot, e que o ReLU morre precocemente com a inicialização em U($-1$,$1$) e bias $-1$. A melhor configuração (\texttt{tanh}, 5 neurônios ocultos, lr 0,01) alcançou 97,8\% $\pm$ 1,9 de acurácia média de teste e, com 1500 épocas, 100\% no conjunto de teste. O sobreajuste foi medido pelo intervalo treino--teste: modesto na Íris, cresce com o tamanho da camada oculta.
+\end{abstract}
+
+\begin{IEEEkeywords}
+perceptron multicamadas, retropropagação, Íris, depuração, convergência, overfitting.
+\end{IEEEkeywords}
+
+\section{Introdução}
+
+O Perceptron Multicamadas (MLP) treinado por retropropagação do gradiente é a arquitetura neural mais elementar capaz de separar classes não linearmente \cite{haykin2009}. Implementá-lo \emph{from scratch} --- sem \texttt{scikit-learn}, PyTorch ou TensorFlow --- expõe todos os detalhes que frameworks escondem: inicialização de pesos, codificação de alvos, atualização de biases, embaralhamento dos dados e cálculo do erro. É também um exercício propenso a bugs discretos, cujos sintomas (acurácia baixa, erro que não desce) raramente apontam diretamente para a causa.
+
+Este trabalho parte da implementação de MLP apresentada em aula (adaptada do \emph{notebook} de Vitor Gama Lemos \cite{lemos2024}) e tem três objetivos, conforme o enunciado: (i)~estudar a implementação e ajudá-la a depurar; (ii)~descobrir como classificar bem as três espécies da base Íris \cite{fisher1936} --- 150 amostras, 4 atributos morfológicos de sépalas e pétalas, 3 classes equilibradas; e (iii)~analisar convergência, erros por classe e sobreajuste.
+
+A contribuição central é o diagnóstico: o código original não conseguia classificar as três classes por causas \emph{externas} ao algoritmo de aprendizado --- dados corrompidos no embaralhamento e avaliação sem função de ativação. Identificados e corrigidos esses defeitos, o mesmo backpropagation passa a atingir 100\% de acurácia de teste na melhor configuração. Relatamos também dois fenômenos instrutivos dos experimentos: a interação entre normalização de atributos e learning rate, e a incompatibilidade entre ReLU e o esquema de inicialização adotado.
+
+\section{A implementação e seus defeitos}
+
+A rede possui uma camada oculta e é treinada amostra a amostra (estocástico). Dada a entrada $\mathbf{x} \in \mathbb{R}^4$, a propagação direta é
+\begin{align}
+\mathbf{h} &= \phi\!\left(\mathbf{x}\,\mathbf{W}^{(1)} + \mathbf{b}^{(1)}\right), \\
+\mathbf{o} &= \phi\!\left(\mathbf{h}\,\mathbf{W}^{(2)} + \mathbf{b}^{(2)}\right),
+\end{align}
+com $\phi$ a função de ativação (\texttt{sigmoid}, \texttt{tanh} ou ReLU), alvos codificados em one-hot $\{0,1\}$ e erro quadrático médio
+\begin{equation}
+E = \frac{1}{2n}\sum_{i=1}^{n}\lVert \mathbf{t}_i - \mathbf{o}_i \rVert^2 .
+\end{equation}
+Os pesos são inicializados uniformemente em $[-1, +1]$ e os biases iniciam em $-1$, como no original. A retropropagação segue o esquema clássico: o delta da saída é $\boldsymbol{\delta}^{(2)} = (\mathbf{o} - \mathbf{t}) \odot \phi'(\mathbf{o})$, o delta oculto é retropropagado pelos pesos sinápticos, $\boldsymbol{\delta}^{(1)} = (\mathbf{W}^{(2)}\boldsymbol{\delta}^{(2)}) \odot \phi'(\mathbf{h})$, e cada peso/bias desce pelo gradiente com taxa de aprendizado $\eta$. Este núcleo estava \textbf{correto}; os problemas estavam à sua volta:
+
+\begin{enumerate}
+\item \textbf{\texttt{predict()} sem função de ativação.} A propagação direta usada na avaliação não aplicava $\phi$ --- a rede era avaliada como um modelo \emph{linear}. O treino aprendia não-linearidades que a avaliação ignorava, destruindo a acurácia mesmo com a rede bem treinada.
+\item \textbf{Erro acumulado entre épocas.} O acumulador de erro nunca era zerado ao início de cada época, de modo que o MSE exibido \emph{crescia monotonicamente} com o número de épocas --- a rede parecia divergir mesmo quando melhorava.
+\item \textbf{Fator $0{,}05$ arbitrário no erro e registro a cada 50 épocas.} A curva de convergência ficava distorcida em escala e sem resolução temporal adequada.
+\item \textbf{Typo \texttt{iasHiddenValue} e ausência de semente.} O parâmetro de bias oculto quebrava silenciosamente a configuração por dicionário de parâmetros, e sem semente própria os pesos não eram reprodutíveis.
+\item \textbf{\texttt{random.shuffle} sobre \texttt{ndarray} 2D --- o bug mais grave.} O módulo \texttt{random} do Python embaralha por trocas \texttt{x[i], x[j] = x[j], x[i]}. Em um \texttt{ndarray} 2D, os lados criam \emph{views} que se sobrescrevem durante a própria atribuição: a operação degenera em \texttt{x[i] = x[j]} duas vezes, \emph{duplicando} linhas e \emph{perdendo} outras. Demonstramos o efeito diretamente: após o embaralhamento ingênuo, as 150 amostras deixam de ser 50/50/50 e a classe \textit{virginica} quase desaparece. A rede era então treinada e avaliada num conjunto corrompido --- era isso, e não o algoritmo, que impedia classificar bem as três classes. A correção é embaralhar \emph{índices} (ou delegar ao \texttt{train\_test\_split}).
+\end{enumerate}
+
+A ausência de normalização de atributos \textbf{não} é um defeito --- mas, como mostram os experimentos, interage fortemente com o learning rate. A versão corrigida registra o MSE de \emph{todas} as épocas, mantém histórico de acurácia treino/teste por época (para análise de sobreajuste) e aceita semente explícita para reprodutibilidade.
+
+\section{Metodologia experimental}
+
+\subsection{Preparação dos dados}
+
+Após a correção, o conjunto é embaralhado por índices e dividido em 80/20 com estratificação por classe (\texttt{random\_state}=11): 120 amostras de treino e 30 de teste, 40/40/40 e 10/10/10 por classe. A normalização z-score, quando adotada, usa média e desvio \emph{apenas do treino}, reaplicados ao teste --- sem vazamento de informação.
+
+\subsection{Protocolo}
+
+Todos os experimentos usam a mesma classe corrigida, variando apenas hiperparâmetros. A grade sistemática combina 3 ativações $\times$ 2 tamanhos de camada oculta (5, 10) $\times$ 2 learning rates (0,01; 0,05), com \textbf{3 sementes} por célula e 1000 épocas, sempre sobre atributos normalizados; reportamos média e desvio-padrão da acurácia de teste para não concluir de uma única sorte de inicialização. O sobreajuste é analisado de duas formas: curvas de acurácia treino/teste por época e o intervalo (gap) treino$-$teste em função do tamanho da camada oculta (2, 5, 10, 20; \texttt{tanh}, lr 0,05, 1200 épocas, 3 sementes).
+
+\section{Resultados}
+
+\subsection{Antes e depois da depuração}
+
+Com o conjunto íntegro e os demais bugs corrigidos, a configuração original (\texttt{sigmoid}, 5 neurônios ocultos, lr 0,005, 3000 épocas, atributos crus) passa a exibir curva de MSE \emph{decrescente} --- de 0,44 até 0,026 --- e acurácias de 97,5\% (treino) e 96,7\% (teste). Ou seja: o backpropagation original já era capaz disso; os defeitos de avaliação e de dados é que o escondiam.
+
+\subsection{Normalização $\times$ learning rate}
+
+Repetindo a configuração original com z-score \emph{sem} ajustar o learning rate, o resultado \emph{piora}: MSE final 0,072 (contra 0,026) e acurácia de teste de 90,0\% (contra 96,7\%). O aparente paradoxo tem explicação: a normalização reduz a escala das entradas e, com ela, a magnitude dos gradientes; o lr 0,005, calibrado \emph{de facto} para entradas grandes, torna-se conservador demais. A grade da Tabela~\ref{tab:grid} confirma que basta \textbf{recalibrar o lr} (0,01--0,05) para a rede normalizada igualar e superar a versão crua.
+
+\begin{table}[!t]
+\caption{Grade de experimentos (z-score, 1000 épocas, média de 3 sementes; ordenada pela acurácia de teste)}
+\label{tab:grid}
+\centering
+\begin{tabular}{llccc}
+\hline
+Ativação & $h$ & lr & Acc.\ treino & Acc.\ teste ($\pm$ dp) \\
+\hline
+tanh     & 5  & 0,01 & 0,978 & \textbf{0,978} $\pm$ 0,019 \\
+sigmoid  & 5  & 0,05 & 0,975 & \textbf{0,978} $\pm$ 0,019 \\
+sigmoid  & 10 & 0,05 & 0,986 & 0,967 $\pm$ 0,000 \\
+tanh     & 10 & 0,01 & 0,986 & 0,967 $\pm$ 0,000 \\
+tanh     & 10 & 0,05 & 0,975 & 0,956 $\pm$ 0,019 \\
+tanh     & 5  & 0,05 & 0,975 & 0,922 $\pm$ 0,019 \\
+sigmoid  & 10 & 0,01 & 0,939 & 0,900 $\pm$ 0,000 \\
+sigmoid  & 5  & 0,01 & 0,922 & 0,900 $\pm$ 0,000 \\
+ReLU     & 10 & 0,01 & 0,750 & 0,744 $\pm$ 0,135 \\
+ReLU     & 5  & 0,01 & 0,442 & 0,444 $\pm$ 0,192 \\
+ReLU     & 5  & 0,05 & 0,350 & 0,344 $\pm$ 0,019 \\
+ReLU     & 10 & 0,05 & 0,336 & 0,333 $\pm$ 0,000 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Convergência por função de ativação}
+
+Nas curvas de MSE ($h$=5, lr 0,05, mesma semente), a \texttt{sigmoid} atinge piso de erro inferior ao da \texttt{tanh} (MSE final 0,031 contra 0,094) --- com alvos one-hot $\{0,1\}$, a \texttt{tanh}, cujo alcance é $(-1,1)$, não consegue representar exatamente 0 e 1, ainda que classifique corretamente pela margem. O ReLU, por sua vez, fica preso em MSE $\approx$ 0,5 e acurácia de 1/3 --- \emph{morte precoce de neurônios}: com pesos U($-1$,$1$) e bias $-1$, boa parte das pré-ativações é negativa, o gradiente do neurônio morto é zero e ele nunca se recupera. A lição é que ativação, inicialização e bias precisam ser compatíveis entre si.
+
+\subsection{Erros por classe e classificação perfeita}
+
+Treinando a melhor configuração da grade (\texttt{tanh}, $h$=5, lr 0,01) por 1500 épocas (semente 0), a rede atinge \textbf{100\% de acurácia no conjunto de teste} (98,3\% no treino), com matriz de confusão perfeita --- as três classes \textit{setosa}, \textit{versicolour} e \textit{virginica} todas em 100\%. A análise por classe confirma a estrutura esperada da base: a \textit{setosa} é linearmente separável das demais e nunca é confundida; os erros residuais das configurações mais fracas (ex.: \texttt{sigmoid} lr 0,005 normalizada, 90\% de teste) concentram-se exclusivamente na fronteira \textit{versicolour} $\times$ \textit{virginica}, as duas espécies com sobreposição morfológica.
+
+\subsection{Sobreajuste}
+
+A Tabela~\ref{tab:overfit} resume o intervalo treino--teste pelo tamanho da camada oculta. O gap cresce com a capacidade --- de $-0{,}8$ p.p.\ com $h$=2 até $+4$ a $+5$ p.p.\ com $h$=5/20 --- mas permanece modesto na Íris: conjunto pequeno e bem separável após as correções. Nas curvas de acurácia por época ($h$=5 contra $h$=20), a curva de teste estaciona enquanto a de treino continua subindo, e o comportamento dominante do excesso de capacidade é a \emph{oscilação} da acurácia de teste, mais do que queda acentuada.
+
+\begin{table}[!t]
+\caption{Sobreajuste $\times$ tamanho da camada oculta (\texttt{tanh}, lr 0,05, 1200 épocas, média de 3 sementes)}
+\label{tab:overfit}
+\centering
+\begin{tabular}{cccc}
+\hline
+$h$ & Acc.\ treino & Acc.\ teste & Gap (p.p.) \\
+\hline
+2  & 0,958 & 0,967 & $-0{,}8$ \\
+5  & 0,975 & 0,922 & $+5{,}3$ \\
+10 & 0,978 & 0,956 & $+2{,}2$ \\
+20 & 0,986 & 0,944 & $+4{,}2$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Discussão}
+
+O resultado mais instrutivo do trabalho é negativo, no bom sentido: \emph{nenhuma} melhoria de hiperparâmetros era capaz de classificar as três classes enquanto os dados estivessem corrompidos e a avaliação, linear. O diagnóstico sistematizou-se em verificar cada elo da cadeia --- dados $\to$ treino $\to$ avaliação --- antes de culpar o algoritmo. A demonstração do defeito do \texttt{random.shuffle} é reproduzível em duas linhas (\texttt{np.bincount} antes/depois) e vale como advertência geral sobre operações de atribuição com \emph{views} do NumPy.
+
+A interação normalização $\times$ learning rate ilustra que hiperparâmetros não são independentes: ``normalizar sempre ajuda'' só vale se o lr for recalibrado junto. Já o fracasso do ReLU mostra que a arquitetura também é um sistema: ativação, inicialização e bias formam um trio que precisa ser coerente. Com pesos U($-1$,$1$) e bias $-1$ --- herdados do original ---, \texttt{sigmoid} e \texttt{tanh} funcionam, e o ReLU não; uma inicialização tipo He com bias positivo resolveria, mas alteraria o espírito de preservar a implementação original.
+
+Por fim, o desvio-padrão entre sementes (até $\pm$1,9 p.p.\ nas melhores células, $\pm$19 no ReLU instável) reforça que conclusões sobre redes pequenas em bases pequenas exigem múltiplas execuções: qualquer célula isolada da grade conta uma história diferente da média.
+
+\section{Conclusão}
+
+Estudamos e depuramos uma implementação de MLP \emph{from scratch} na base Íris, corrigindo cinco defeitos --- o mais grave, o embaralhamento que corrompia o conjunto de dados e quase eliminava a classe \textit{virginica}. O algoritmo de retropropagação original estava correto: com dados íntegros e avaliação não linear, a configuração original já atinge 96,7\% de teste; a melhor da grade (\texttt{tanh}, 5 neurônios, lr 0,01, z-score) chega a 97,8\% $\pm$ 1,9 e, com 1500 épocas, a \textbf{100\% nas três classes}. A análise de convergência mostrou pisos de erro distintos por ativação (compatibilidade com alvos one-hot e com a inicialização), e a de sobreajuste, um gap treino--teste modesto que cresce com a capacidade. Como trabalho futuro, restam inicialização adequada ao ReLU, taxa adaptativa e validação cruzada $k$-fold para estimar variância com mais amostras.
+
+\section*{Repositório}
+
+O \emph{notebook} e os resultados estão disponíveis em: \href{https://github.com/gg-gustavo/mlp-scratch-iris}{https://github.com/gg-gustavo/mlp-scratch-iris}
+
+\begin{thebibliography}{1}
+\bibitem{fisher1936} R.~A. Fisher, ``The use of multiple measurements in taxonomic problems,'' \emph{Annals of Eugenics}, vol.~7, no.~2, pp. 179--188, 1936.
+\bibitem{haykin2009} S.~Haykin, \emph{Neural Networks and Learning Machines}, 3rd ed. Upper Saddle River, NJ, USA: Pearson, 2009.
+\bibitem{lemos2024} V.~G. Lemos, ``Multilayer perceptron from scratch,'' Kaggle, 2024. [Online]. Disponível em: \href{https://www.kaggle.com/code/vitorgamalemos/multilayer-perceptron-from-scratch}{kaggle.com/code/vitorgamalemos/multilayer-perceptron-from-scratch}
+\end{thebibliography}
+
+\end{document}
